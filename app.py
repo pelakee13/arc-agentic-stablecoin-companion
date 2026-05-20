@@ -279,43 +279,85 @@ def check_network_status() -> dict:
 # Gemini setup
 # ──────────────────────────────────────────────
 
-def get_gemini_client():
-    """Initialise Gemini with the API key from Streamlit secrets."""
+def get_gemini_client() -> bool:
+    """
+    Configure the google-generativeai SDK with the key from Streamlit secrets.
+
+    genai.configure() must be called before *any* GenerativeModel is created.
+    We call it on every page load (it's idempotent) so Streamlit reruns never
+    miss it, and we cache the key in session_state for get_or_create_chat().
+    """
     try:
         api_key = st.secrets["GOOGLE_API_KEY"]
         genai.configure(api_key=api_key)
+        st.session_state["_gemini_api_key"] = api_key  # keep for chat recreation
         return True
+    except KeyError:
+        return False
     except Exception:
         return False
 
 
 def get_or_create_chat():
-    """Return a persistent Gemini chat session stored in session state."""
+    """
+    Return a persistent Gemini chat session stored in session state.
+
+    Key fixes vs the previous version:
+    • model_name uses the "models/" prefix — required by the v1beta REST
+      endpoint that google-generativeai 0.7+ targets.  The bare string
+      "gemini-1.5-flash" triggers a 404 from the API ("not found for API
+      version v1beta").  "models/gemini-1.5-flash" resolves correctly.
+    • safety_settings now uses the HarmCategory / HarmBlockThreshold enums
+      instead of plain strings, which were silently ignored in newer SDK
+      versions and could cause unexpected errors.
+    • genai.configure() is called again here as a safety net in case the
+      chat session is being recreated on a fresh Streamlit worker process.
+    """
     if "gemini_chat" not in st.session_state:
+        # Re-apply config in case this runs in a fresh worker
+        api_key = st.session_state.get("_gemini_api_key") or st.secrets.get("GOOGLE_API_KEY", "")
+        genai.configure(api_key=api_key)
+
+        HarmCategory  = genai.types.HarmCategory
+        HarmThreshold = genai.types.HarmBlockThreshold
+
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            # "models/" prefix is required — bare name hits a v1beta 404
+            model_name="models/gemini-1.5-flash",
             system_instruction=SYSTEM_PROMPT,
             generation_config=genai.GenerationConfig(
                 temperature=0.7,
                 max_output_tokens=2048,
             ),
-            safety_settings=[
-                {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_ONLY_HIGH"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH",       "threshold": "BLOCK_ONLY_HIGH"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"},
-            ],
+            safety_settings={
+                HarmCategory.HARM_CATEGORY_HARASSMENT:        HarmThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH:       HarmThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmThreshold.BLOCK_ONLY_HIGH,
+            },
         )
         st.session_state.gemini_chat = model.start_chat(history=[])
     return st.session_state.gemini_chat
 
 
 def stream_gemini_response(chat, user_message: str):
-    """Stream a response from Gemini and yield text chunks."""
+    """
+    Stream a response from Gemini and yield text chunks.
+
+    Calling response.resolve() after the loop ensures the underlying
+    HTTP stream is fully consumed and closed — prevents ResourceWarning
+    and iterator-exhaustion bugs seen in google-generativeai 0.7+.
+    """
     response = chat.send_message(user_message, stream=True)
     for chunk in response:
-        if chunk.text:
-            yield chunk.text
+        text = getattr(chunk, "text", None)
+        if text:
+            yield text
+    # Drain and close the stream (no-op if already done)
+    try:
+        response.resolve()
+    except Exception:
+        pass
 
 # ──────────────────────────────────────────────
 # Sidebar
